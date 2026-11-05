@@ -1,0 +1,350 @@
+import asyncio
+import logging
+import os
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Depends, Request, Response, Path
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from contextlib import asynccontextmanager
+from datetime import datetime
+from .demo_devices import get_demo
+from .snmp_poller import RealSNMPPoller
+from .influx_client import InfluxClient
+from .websocket import ConnectionManager
+from .alert_manager import AlertManager
+from .syslog_listener import SyslogListener
+from .database import create_tables
+from .routers import endpoint_auth
+from dotenv import load_dotenv
+from typing import Annotated
+from pathlib import Path as FilePath
+from pydantic import IPvAnyAddress
+from .auth.dependencies import get_current_active_user
+from app.models.user import User
+from slowapi.errors import RateLimitExceeded
+from .ratelimit import limiter, RateLimit, rate_limit_handler
+
+# Load environment variables
+env_path = FilePath(__file__).parent.parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global instances
+manager = ConnectionManager()
+influx_client = None
+poller = None
+alert_manager = None
+syslog_listener = None
+
+def get_int_env(key: str, default: int, min_val: int = None, max_val: int = None) -> int:
+    raw_value = os.getenv(key)
+    try:
+        result = int(raw_value)
+    except (ValueError, TypeError):
+        result = default
+        logger.warning(f"Could not convert {key}, using default value {default}")
+    
+    # Check minimum bound
+    if min_val is not None and result < min_val:
+        original_value = result
+        result = min_val
+        logger.warning(f"{key} value {original_value} below minimum {min_val}, using {min_val}")
+    
+    # Check maximum bound
+    if max_val is not None and result > max_val:
+        original_value = result
+        result = max_val
+        logger.warning(f"{key} value {original_value} above maximum {max_val}, using {max_val}")
+    
+    return result
+
+def get_required_env(key: str, allow_empty: bool = False) -> str:
+    value = os.getenv(key)
+    
+    # Check if variable doesn't exist at all
+    if value is None:
+        raise ValueError(f"Required environment variable '{key}' is not set")   
+    value = value.strip()
+
+    # Check if it's empty (and if that's not allowed)
+    if not value and not allow_empty:
+        raise ValueError(f"Required environment variable '{key}' is empty")
+    return value
+
+# Security headers middleware
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        return response
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events"""
+    global influx_client, poller, alert_manager, syslog_listener
+
+    # Startup
+    logger.info("Starting Network Monitoring API...")
+
+    # Create database tables (for auth)
+    await create_tables()
+    logger.info("Database tables created")
+
+    # Initialize InfluxDB client
+    influx_client = InfluxClient()
+
+    # Initialize AlertManager and connect SMTP
+    alert_manager = AlertManager(influx_client=influx_client)
+    await alert_manager.connect_smtp()
+
+    # Initialize and start poller with secure environment validation
+    poller = RealSNMPPoller(
+        influx_client=influx_client,
+        community=get_required_env("SNMP_COMMUNITY"),
+        timeout=get_int_env("SNMP_TIMEOUT", default=2, min_val=1, max_val=30),
+        retries=get_int_env("SNMP_RETRIES", default=3, min_val=0, max_val=5),
+        poll_interval=get_int_env("SNMP_POLL_INTERVAL", default=60, min_val=10, max_val=3600)
+    )
+
+    poller.start()
+
+    # Initialize and start syslog listener if enabled
+    if os.getenv("SYSLOG_ENABLED", "false").lower() == "true":
+        syslog_listener = SyslogListener(
+            influx_client=influx_client,
+            alert_manager=alert_manager,
+            ws_manager=manager,
+        )
+        syslog_listener.start()
+        logger.info(f"Syslog listener started on UDP port {syslog_listener.port}")
+
+    logger.info("Application started successfully")
+
+    # Background task to broadcast updates
+    asyncio.create_task(broadcast_updates())
+
+    yield
+
+    # Shutdown
+    logger.info(" Shutting down...")
+    if alert_manager:
+        await alert_manager.disconnect_smtp()
+    if syslog_listener:
+        syslog_listener.stop()
+    if poller:
+        poller.stop()
+    if influx_client:
+        influx_client.close()
+    logger.info(" Shutdown complete")
+
+# Initialize the FastAPI app
+app = FastAPI(
+    title="Network Monitoring API",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url=None,          
+    openapi_url=None,       
+    redoc_url=None          
+)
+
+# CORS Permissions
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS").split(",")
+
+#Add rate limiter 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=600,
+)
+
+# Add security headers to all responses
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Add auth endpoints
+app.include_router(endpoint_auth.router)
+
+async def broadcast_updates():
+    #Background task to broadcast device updates via WebSocket
+    while True:
+        try:
+            await asyncio.sleep(10)
+            
+            if poller and manager.get_connection_count() > 0:
+                devices = poller.get_all_devices()
+                await manager.broadcast_connection({
+                    "type": "update",
+                    "timestamp": datetime.now().isoformat(),
+                    "data": list(devices.values())
+                })
+                
+        except Exception as e:
+            logger.error(f"Error in broadcast_updates: {e}")
+
+@app.get("/")
+@limiter.limit(RateLimit.ROOT_LIMIT)
+async def root(request: Request, response: Response):
+    # API root
+    return {
+        "message": "Network Monitoring API",
+        "status": "running",
+        "version": "0.1.0",
+        "endpoints": {
+            "health": "/api/health",
+            "devices": "/api/devices",
+            "device_detail": "/api/devices/{ip}",
+            "device_history": "/api/devices/{ip}/history",
+            "websocket": "/ws"
+        }
+    }
+
+@app.get("/api/health")
+@limiter.limit(RateLimit.HEALTH_LIMIT)
+async def health(request: Request, response: Response):
+    # Health Check
+    return {
+        "status": "ok",
+        "timestamp":datetime.now().isoformat(),
+        "poller_running": poller.running if poller else False,
+        "influxdb_connected": influx_client.client is not None if influx_client else False,
+        "websocket_connections": manager.get_connection_count()
+    }    
+    
+
+@app.get("/api/devices")
+@limiter.limit(RateLimit.DEVICES_LIMIT, key_func=RateLimit.get_user_or_ip)
+async def get_devices(request: Request, response: Response, current_user: User = Depends(get_current_active_user)):
+    # Get all devices with current status
+    try:
+        if not poller:
+            # Fallback to demo data if poller not initialized
+            logger.warning("Poller not initialized, returning demo data")
+            devices = get_demo()
+        else:
+            devices_dict = poller.get_all_devices()
+            if not devices_dict:
+                # If poller hasn't collected data yet, return demo data
+                devices = get_demo()
+            else:
+                devices = list(devices_dict.values())
+        
+        logger.info(f"Returning {len(devices)} devices")
+        return {"success": True, "data": devices, "count": len(devices)}
+        
+    except Exception as e:
+        logger.error(f"Error fetching devices: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    
+@app.get("/api/devices/{device_ip}")
+@limiter.limit(RateLimit.DEVICE_DETAIL_LIMIT, key_func=RateLimit.get_user_or_ip)
+async def get_device_detail(
+    request: Request, 
+    response: Response, 
+    device_ip: Annotated[IPvAnyAddress, Path(title="The device IP address")], 
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get detailed info for a specific device"""
+    try:
+        device_ip_str = str(device_ip)
+
+        if not poller:
+            raise HTTPException(status_code=503, detail="Poller not initialized")
+
+        device_data = poller.device_data.get(device_ip_str)
+        
+        if not device_data:
+            raise HTTPException(status_code=404, detail=f"Device {device_ip_str} not found")
+        
+        return {"success": True, "data": device_data}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching device {device_ip_str}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/devices/{device_ip}/history")
+@limiter.limit(RateLimit.DEVICE_HISTORY_LIMIT, key_func=RateLimit.get_user_or_ip)
+async def get_device_history(
+    request: Request,
+    response: Response,
+    device_ip: Annotated[IPvAnyAddress, Path(title="The device IP address")],
+    hours: Annotated[int, Query(ge=1, le=168, description="Hours of history (1-168)")] = 1,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get historical metrics for a device from InfluxDB"""
+    try:
+        device_ip_str = str(device_ip)
+
+        if not influx_client or not influx_client.client:
+            raise HTTPException(
+                status_code=503,
+                detail="InfluxDB not available. Historical data not accessible."
+            )
+
+        history = influx_client.query_device_history(device_ip_str, hours)
+
+        return {
+            "success": True,
+            "device_ip": device_ip_str,
+            "hours": hours,
+            "data": history,
+            "count": len(history)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching history for {device_ip_str}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    
+    try:
+        # Send initial connection message
+        await websocket.send_json({
+            "type": "connected",
+            "message": "WebSocket connected",
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Send current device data immediately
+        if poller:
+            devices = poller.get_all_devices()
+            await websocket.send_json({
+                "type": "initial",
+                "timestamp": datetime.now().isoformat(),
+                "data": list(devices.values())
+            })
+        
+        # Keep connection alive and wait for messages
+        while True:
+            data = await websocket.receive_text()
+            logger.info(f"Received message from client: {data}")
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        manager.disconnect(websocket)
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+
